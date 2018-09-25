@@ -22,7 +22,7 @@
 // ** WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.    
 // *=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=* 
 //////////////////////////////////////////////////////////////////////////
-// FindSurfaceVel.hh
+// HcrSurfaceVel.hh
 //
 // Mike Dixon, EOL, NCAR, P.O.Box 3000, Boulder, CO, 80307-3000, USA
 //
@@ -30,17 +30,19 @@
 //
 //////////////////////////////////////////////////////////////////////////
 //
-// FindSurfaceVel is intended for use with downward-pointing airborne
+// HcrSurfaceVel is intended for use with downward-pointing airborne
 // Doppler radars.
 //
-// FindSurfaceVel reads in Radx moments, computes the apparent velocity
-// of the ground echo, and filters the apparent velocity in time to remove
-// spurious spikes.
+// HcrSurfaceVel reads in Radx moments, and computes the apparent velocity
+// of the surface echo.
+//
+// Generally this will require some filtering. See:
+//   HcrVelFirFilt
 //
 //////////////////////////////////////////////////////////////////////////
 
-#ifndef FindSurfaceVel_HH
-#define FindSurfaceVel_HH
+#ifndef HcrSurfaceVel_HH
+#define HcrSurfaceVel_HH
 
 #include <string>
 #include <deque>
@@ -49,75 +51,52 @@
 class RadxRay;
 using namespace std;
 
-class FindSurfaceVel {
+class HcrSurfaceVel {
   
 public:
 
   // constructor
   
-  FindSurfaceVel();
+  HcrSurfaceVel();
 
   // destructor
   
-  ~FindSurfaceVel();
+  ~HcrSurfaceVel();
 
   // set methods
 
   void setDebug(bool val) { _debug = val; }
   void setVerbose(bool val) { _verbose = val; }
 
+  // name of dbz and vel fields in data
+
   void setDbzFieldName(const string &name) { _dbzFieldName = name; };
   void setVelFieldName(const string &name) { _velFieldName = name; };
 
+  // max pointing error off nadir for valid measurement
+
+  void setMaxNadirErrorDeg(double val) { _maxNadirErrorDeg = val; }
+
+  // finding the surface
+  
   void setMinRangeToSurfaceKm(double val) { _minRangeToSurfaceKm = val; }
+  void setMaxSurfaceHeightKm(double val) { _maxSurfaceHeightKm = val; }
   void setMinDbzForSurfaceEcho(double val) { _minDbzForSurfaceEcho = val; }
   void setNGatesForSurfaceEcho(int val) { _nGatesForSurfaceEcho = val; }
 
-  void setSpikeFilterDifferenceThreshold(double val) {
-    _spikeFilterDifferenceThreshold = val; 
-  }
-
-  // initialzie the filters from arrays
-  
-  void initFilters(int stage1FilterLen,
-                   const double *filtCoeffStage1,
-                   int spikeFilterLen,
-                   const double *filtCoeffSpike,
-                   int finalFilterLen,
-                   const double *filtCoeffFinal);
-
-  // initialize the filters from vectors
-  
-  void initFilters(const vector<double> &filtCoeffStage1,
-                   const vector<double> &filtCoeffSpike,
-                   const vector<double> &filtCoeffFinal);
-
-                                 
-  // Process an incoming ray
+  // compute surface velocity - no filtering
+  //
+  // Sets vel to 0.0 if cannot determine velocity.
+  // Also sets dbzSurf and rangeToSurf.
   // Returns 0 on success, -1 on failure.
-  // On success, call getSurfaceVelocity() to get computed surface velocity
   
-  int processRay(RadxRay *ray);
-
-  // get results, on condition that processRay() returns success, i.e. 0
+  int computeSurfaceVel(const RadxRay *ray,
+                        double &velSurf,
+                        double &dbzSurf,
+                        double &rangeToSurf) const;
   
-  bool velocityIsValid() const { return _velIsValid; }
-  double getSurfaceVelocity() const { return _surfaceVel; }
-  RadxRay *getFiltRay() { return _filtRay; }
-
 protected:
 private:
-
-  // default filters
-
-  static const int Stage1FilterDefaultLen = 21;
-  static const double stage1FilterDefault[Stage1FilterDefaultLen];
-
-  static const int SpikeFilterDefaultLen = 101;
-  static const double spikeFilterDefault[SpikeFilterDefaultLen];
-
-  static const int FinalFilterDefaultLen = 41;
-  static const double finalFilterDefault[FinalFilterDefaultLen];
 
   // debugging
 
@@ -130,53 +109,16 @@ private:
   string _velFieldName;
 
   // parameters
-
+  
   double _minRangeToSurfaceKm;
+  double _maxSurfaceHeightKm;
   double _minDbzForSurfaceEcho;
   int _nGatesForSurfaceEcho;
-  double _spikeFilterDifferenceThreshold;
-
-  // storing incoming rays long enough to compute filtered results
-
-  deque<RadxRay *> _filtRays;
-  
-  // filtering
-
-  vector<double> _filtCoeffStage1;
-  vector<double> _filtCoeffSpike;
-  vector<double> _filtCoeffFinal;
-  
-  size_t _lenStage1, _lenStage1Half;
-  size_t _lenSpike, _lenSpikeHalf;
-  size_t _lenFinal, _lenFinalHalf;
-
-  size_t _condIndex;
-  size_t _finalIndex;
-  size_t _filtBufLen;
-
-  size_t _nValid;
-
-  double *_dbzMax;
-  double *_rangeToSurface;
-  double *_surfaceVelArray;
-
-  double *_filteredStage1;
-  double *_filteredSpike;
-  double *_filteredCond;
-  double *_filteredFinal;
-
-  // results
-  
-  bool _velIsValid;
-  double _surfaceVel;
-  RadxRay *_filtRay;
+  double _maxNadirErrorDeg;
 
   // methods
 
-  void _initFromFilters();
-
-  void _computeSurfaceVel(RadxRay *ray);
-
+  void _initFromFirFilters();
   void _applyStage1Filter();
   void _applySpikeFilter();
   void _applyFinalFilter();

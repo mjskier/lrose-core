@@ -38,15 +38,16 @@
 //////////////////////////////////////////////////////////////////////////
 
 #include "HcrVelCorrect.hh"
-#include <Radx/RadxRay.hh>
 #include <Mdv/GenericRadxFile.hh>
 #include <Radx/RadxGeoref.hh>
 #include <Radx/RadxTimeList.hh>
 #include <Radx/RadxPath.hh>
+#include <Radx/RadxXml.hh>
 #include <dsserver/DsLdataInfo.hh>
+#include <Spdb/DsSpdb.hh>
 #include <didss/DsInputPath.hh>
-#include <toolsa/TaXml.hh>
 #include <toolsa/pmu.h>
+#include <algorithm>
 using namespace std;
 
 // Constructor
@@ -56,7 +57,6 @@ HcrVelCorrect::HcrVelCorrect(int argc, char **argv)
 {
 
   OK = TRUE;
-  _firstInputFile = true;
 
   // set programe name
 
@@ -82,19 +82,11 @@ HcrVelCorrect::HcrVelCorrect(int argc, char **argv)
     return;
   }
   
-  // set up the surface velocity filtering
+  // set up the surface velocity object
 
-  _surfVel.initFilters(_params.stage1_filter_n,
-                       _params._stage1_filter,
-                       _params.spike_filter_n,
-                       _params._spike_filter,
-                       _params.final_filter_n,
-                       _params._final_filter);
-
-  if (_params.debug) {
-    _surfVel.setDebug(true);
-  }
   if (_params.debug >= Params::DEBUG_VERBOSE) {
+    _surfVel.setDebug(true);
+  } else if (_params.debug >= Params::DEBUG_EXTRA) {
     _surfVel.setVerbose(true);
   }
 
@@ -102,10 +94,33 @@ HcrVelCorrect::HcrVelCorrect(int argc, char **argv)
   _surfVel.setVelFieldName(_params.vel_field_name);
 
   _surfVel.setMinRangeToSurfaceKm(_params.min_range_to_surface_km);
+  _surfVel.setMaxSurfaceHeightKm(_params.max_surface_height_km);
   _surfVel.setMinDbzForSurfaceEcho(_params.min_dbz_for_surface_echo);
   _surfVel.setNGatesForSurfaceEcho(_params.ngates_for_surface_echo);
-  _surfVel.setSpikeFilterDifferenceThreshold(_params.spike_filter_difference_threshold);
+  _surfVel.setMaxNadirErrorDeg(_params.max_nadir_error_for_surface_vel);
   
+  // initialize the wave filtering
+
+  _initWaveFilt();
+
+  // initialize the FIR filtering
+
+  if (_params.debug >= Params::DEBUG_VERBOSE) {
+    _firFilt.setDebug(true);
+  } else if (_params.debug >= Params::DEBUG_EXTRA) {
+    _firFilt.setVerbose(true);
+  }
+
+  _firFilt.setSpikeFilterDifferenceThreshold
+    (_params.spike_filter_difference_threshold);
+  
+  _firFilt.initFirFilters(_params.stage1_filter_n,
+                          _params._stage1_filter,
+                          _params.spike_filter_n,
+                          _params._spike_filter,
+                          _params.final_filter_n,
+                          _params._final_filter);
+
   // init process mapper registration
 
   if (_params.register_with_procmap) {
@@ -122,10 +137,25 @@ HcrVelCorrect::~HcrVelCorrect()
 
 {
 
-  // close queues
+  // write out rays which have not yet been written
+  // this only applies to the wave filter option
+  
+  if (_params.filter_type == Params::WAVE_FILTER) {
+    while (_filtQueue.size() > 1) {
+      FiltNode &oldest = _filtQueue[0];
+      // not yet written out, do so now
+      _addNodeRayToFiltVol(oldest);
+      if (_params.write_surface_vel_results_to_spdb) {
+        _writeFirFiltResultsToSpdb(oldest.ray);
+      }
+      RadxRay::deleteIfUnused(oldest.ray);
+      _filtQueue.pop_front();
+    }
+  }
 
-  _inputFmq.closeMsgQueue();
-  _outputFmq.closeMsgQueue();
+  // write out any pending data
+
+  _writeFiltVol();
 
   // unregister process
 
@@ -140,20 +170,15 @@ int HcrVelCorrect::Run()
 {
 
   switch (_params.mode) {
-    case Params::FMQ:
-      return _runFmq();
     case Params::ARCHIVE:
       return _runArchive();
     case Params::REALTIME:
-      if (_params.latest_data_info_avail) {
-        return _runRealtimeWithLdata();
-      } else {
-        return _runRealtimeNoLdata();
-      }
+      return _runRealtime();
     case Params::FILELIST:
     default:
       return _runFilelist();
   } // switch
+
 }
 
 //////////////////////////////////////////////////
@@ -165,16 +190,12 @@ int HcrVelCorrect::_runFilelist()
   // loop through the input file list
 
   int iret = 0;
-
   for (int ii = 0; ii < (int) _args.inputFileList.size(); ii++) {
-
     string inputPath = _args.inputFileList[ii];
     if (_processFile(inputPath)) {
       iret = -1;
     }
-
   }
-
   return iret;
 
 }
@@ -222,7 +243,7 @@ int HcrVelCorrect::_runArchive()
 //////////////////////////////////////////////////
 // Run in realtime mode with latest data info
 
-int HcrVelCorrect::_runRealtimeWithLdata()
+int HcrVelCorrect::_runRealtime()
 {
 
   // watch for new data to arrive
@@ -243,59 +264,6 @@ int HcrVelCorrect::_runRealtimeWithLdata()
       iret = -1;
     }
   }
-
-  return iret;
-
-}
-
-//////////////////////////////////////////////////
-// Run in realtime mode without latest data info
-
-int HcrVelCorrect::_runRealtimeNoLdata()
-{
-
-  // Set up input path
-
-  DsInputPath input(_progName,
-		    _params.debug >= Params::DEBUG_VERBOSE,
-		    _params.input_dir,
-		    _params.max_realtime_data_age_secs,
-		    PMU_auto_register,
-		    _params.latest_data_info_avail,
-		    false);
-
-  input.setFileQuiescence(_params.file_quiescence);
-  input.setSearchExt(_params.search_ext);
-  input.setRecursion(_params.search_recursively);
-  input.setMaxRecursionDepth(_params.max_recursion_depth);
-  input.setMaxDirAge(_params.max_realtime_data_age_secs);
-
-  int iret = 0;
-
-  while(true) {
-
-    // check for new data
-    
-    char *path = input.next(false);
-    
-    if (path == NULL) {
-      
-      // sleep a bit
-      
-      PMU_auto_register("Waiting for data");
-      umsleep(_params.wait_between_checks * 1000);
-
-    } else {
-
-      // process the file
-
-      if (_processFile(path)) {
-        iret = -1;
-      }
-      
-    }
-
-  } // while
 
   return iret;
 
@@ -345,48 +313,500 @@ int HcrVelCorrect::_processFile(const string &readPath)
       cerr << "  ==>> read in file: " << _readPaths[ii] << endl;
     }
   }
-  if (_firstInputFile) {
-    _inEndTime.set(_inVol.getEndTimeSecs(), _inVol.getEndNanoSecs() / 1.0e9);
-    _filtVol.copyMeta(_inVol);
-    _firstInputFile = false;
-  }
+
+  // copy the meta data to the filtered vol
+
+  _filtVol.copyMeta(_inVol);
   
+  // save the end time, so we know when to write out file
+  // associated with this data
+  
+  RadxTime fileEndTime(_inVol.getEndTimeSecs(), 
+                       _inVol.getEndNanoSecs() / 1.0e9);
+  _inputFileEndTime.push_back(fileEndTime);
+  
+  // process each ray in the volume
+  
+  int iret = 0;
   vector<RadxRay *> rays = _inVol.getRays();
   for (size_t iray = 0; iray < rays.size(); iray++) {
 
-    RadxRay *ray = new RadxRay(*rays[iray]);
+    // create a copy of the ray
+    // add a client to the copy to keep track of usage
+    // the filter and the write volume will both try to delete
+    // the ray if no longer used
     
-    // process each ray in the volume
+    RadxRay *rayCopy = new RadxRay(*rays[iray]);
+    rayCopy->addClient();
     
-    if (_surfVel.processRay(ray) == 0) {
-      
-      RadxRay *outRay = _surfVel.getFiltRay();
-      RadxTime filtRayTime = outRay->getRadxTime();
+    // process the ray
+    // computing vel and filtering
 
-      if (_surfVel.velocityIsValid()) {
-        double surfVel = _surfVel.getSurfaceVelocity();
-        _correctVelForRay(ray, surfVel);
-      } else {
-        _copyVelForRay(ray);
+    if (_params.filter_type == Params::WAVE_FILTER) {
+      if (_processRayWaveFilt(rayCopy)) {
+        iret = -1;
       }
-      
-      // write vol when done
-      
-      if (filtRayTime > _inEndTime) {
-        _writeFiltVol();
-        _inEndTime.set(_inVol.getEndTimeSecs(), _inVol.getEndNanoSecs() / 1.0e9);
+    } else {
+      if (_processRayFirFilt(rayCopy)) {
+        iret = -1;
       }
-      
-      // add to output vol
-      
-      _filtVol.addRay(outRay);
-
-    }
-
+    } // if (_params.filter_type == Params::WAVE_FILTER) 
+    
   } // iray
+  
+  return iret;
+
+}
+
+//////////////////////////////////////////////////
+// Process a ray, filtering with FIR filter
+
+int HcrVelCorrect::_processRayFirFilt(RadxRay *ray)
+  
+{
+
+  // init
+
+  _velIsValid = true;
+
+  // get surface vel
+  
+  double velSurf, dbzSurf, rangeToSurf;
+  if (_surfVel.computeSurfaceVel(ray,
+                                 velSurf,
+                                 dbzSurf,
+                                 rangeToSurf)) {
+    velSurf = 0.0;
+    rangeToSurf = 0.0;
+    dbzSurf = -9999.0;
+    _velIsValid = false;
+  }
+
+  // apply FIR filter to get filtered velocity
+
+  _velFilt = 0.0;
+  if (_firFilt.filterRay(ray, velSurf, dbzSurf, rangeToSurf)) {
+    return -1;
+  }
+  
+  _filtRay = _firFilt.getFiltRay();
+  if (_velIsValid) {
+    _velIsValid = _firFilt.velocityIsValid();
+  }
+  if (_velIsValid) {
+    _velFilt = _firFilt.getVelFilt();
+    _correctVelForRay(_filtRay, _velFilt);
+  } else {
+    _copyVelForRay(_filtRay);
+  }
+  
+  RadxTime filtRayTime = _filtRay->getRadxTime();
+  
+  // write vol when done
+  
+  if ((_inputFileEndTime.size() > 0) &&
+      (filtRayTime > _inputFileEndTime[0])) {
+    _writeFiltVol();
+    _inputFileEndTime.pop_front();
+  }
+  
+  // add to output vol
+  
+  _filtVol.addRay(_filtRay);
+  
+  // write results to SPDB in XML if requested
+  
+  if (_params.write_surface_vel_results_to_spdb) {
+    _writeFirFiltResultsToSpdb(_filtRay);
+  }
+
+  return 0;
+
+}
+  
+//////////////////////////////////////////////////
+// Process a ray, filtering with wave filter
+
+int HcrVelCorrect::_processRayWaveFilt(RadxRay *ray)
+  
+{
+
+  // init
+  
+  _velIsValid = true;
+
+  // get surface vel
+  
+  double velSurf, dbzSurf, rangeToSurf;
+  if (_surfVel.computeSurfaceVel(ray,
+                                 velSurf,
+                                 dbzSurf,
+                                 rangeToSurf)) {
+    velSurf = 0.0;
+    rangeToSurf = 0.0;
+    dbzSurf = -9999.0;
+    _velIsValid = false;
+  }
+
+  // apply wave filter to get filtered velocity
+
+  _velFilt = 0.0;
+
+  if (_applyWaveFilt(ray, velSurf, dbzSurf, rangeToSurf)) {
+    return -1;
+  }
+  
+  _filtRay = _waveNodeMid->ray;
+  if (_velIsValid) {
+    if (_params.wave_filter_type == Params::WAVE_MEAN) {
+      _velFilt = _waveNodeMid->velWaveFiltMean;
+    } else if (_params.wave_filter_type == Params::WAVE_MEDIAN) {
+      _velFilt = _waveNodeMid->velWaveFiltMedian;
+    } else {
+      _velFilt = _waveNodeMid->velWaveFiltPoly;
+    }
+    _correctVelForRay(_filtRay, _velFilt);
+    _waveNodeMid->velIsValid = true;
+    _waveNodeMid->corrected = true;
+  } else {
+    _copyVelForRay(_filtRay);
+    _waveNodeMid->velIsValid = false;
+    _waveNodeMid->corrected = false;
+  }
+  
+  RadxTime filtRayTime = _filtRay->getRadxTime();
+  
+  // write vol when done
+  
+  if ((_inputFileEndTime.size() > 0) &&
+      (filtRayTime > _inputFileEndTime[0])) {
+    _writeFiltVol();
+    _inputFileEndTime.pop_front();
+  }
+  
+  // add to output vol
+  
+  _filtVol.addRay(_filtRay);
+  
+  // write results to SPDB in XML if requested
+  
+  if (_params.write_surface_vel_results_to_spdb) {
+    _writeWaveFiltResultsToSpdb(_filtRay);
+  }
   
   return 0;
 
+}
+  
+///////////////////////////////////////////////////////////////////
+// Initialize the wave filter
+
+void HcrVelCorrect::_initWaveFilt()
+
+{
+
+  // init
+
+  _nNoiseNodes = 0;
+
+  _velIsValid = false;
+  _filtRay = NULL;
+  _velFilt = 0.0;
+
+  _waveIndexStart = 0;
+  _waveIndexMid = 0;
+  _waveIndexEnd = 0;
+  _waveNodeMid = NULL;
+
+  _noiseIndexStart = 0;
+  _noiseIndexMid = 0;
+  _noiseIndexEnd = 0;
+  _noiseNodeMid = NULL;
+
+  // filter length
+  
+  _noiseFiltSecs = _params.noise_filter_length_secs;
+  _waveFiltSecs = _params.wave_filter_length_secs;
+  _totalFiltSecs = _noiseFiltSecs + _waveFiltSecs;
+
+  _poly.setOrder(_params.wave_polynomial_order);
+
+}
+
+///////////////////////////////////////////////////////////////////
+// Apply the wave filter an incoming ray, filtering the surface vel.
+// Returns 0 on success, -1 on failure.
+
+int HcrVelCorrect::_applyWaveFilt(RadxRay *ray,
+                                  double velSurf,
+                                  double dbzSurf,
+                                  double rangeToSurf)
+
+{
+
+  // add new node to queue
+  // oldest nodes are at the front, youngest nodes are at the back
+  // so time increases from front to back
+  // initialize all velocities with surface vel
+
+  FiltNode node;
+  node.dbzSurf = dbzSurf;
+  node.rangeToSurf = rangeToSurf;
+  node.ray = ray;
+  node.velSurf = velSurf;
+  node.velNoiseFilt = velSurf;
+  node.velNoiseFiltMean = velSurf;
+  node.velNoiseFiltMedian = velSurf;
+  node.velWaveFiltMean = velSurf;
+  node.velWaveFiltMedian = velSurf;
+  node.velWaveFiltPoly = velSurf;
+  _filtQueue.push_back(node);
+
+  // Set the time limits for the filters
+  // this will also write out any rays that are discarded
+  // without having been written
+
+  if (_setFilterLimits()) {
+    return -1;
+  }
+
+  if ((int) _filtQueue.size() < _params.wave_filter_min_n_rays) {
+    _velIsValid = false;
+    return 0;
+  }
+
+  // run the noise filter first
+
+  _runNoiseFilter();
+
+  // then run the wave filter
+
+  _runWaveFilter();
+
+  return 0;
+
+}
+
+//////////////////////////////////////////////////
+// Set the time limits for the filters
+// Side effects:
+//   compute times
+//   write out rays to be discarded that have not been written
+//   determine if we have enough data for valid stats
+
+int HcrVelCorrect::_setFilterLimits()
+{
+
+  if (_filtQueue.size() < 1) {
+    return -1;
+  }
+
+  // set up noise filter time limits
+  
+  _noiseTimeEnd = _filtQueue[_filtQueue.size()-1].getTime();
+  _noiseTimeStart = _noiseTimeEnd - _noiseFiltSecs;
+  
+  // compute start time for wave filter
+  
+  _waveTimeEnd = _noiseTimeStart;
+  _wavePeriodStart = _waveTimeEnd - _waveFiltSecs;
+  
+  // discard nodes older than _wavePeriodStart,
+  // writing out rays from discarded nodes
+  
+  while (_filtQueue.size() > 1) {
+    FiltNode &oldest = _filtQueue[0];
+    if (oldest.getTime() < _wavePeriodStart) {
+      // not yet written out, do so now
+      _addNodeRayToFiltVol(oldest);
+      RadxRay::deleteIfUnused(oldest.ray);
+      _filtQueue.pop_front();
+    } else {
+      break;
+    }
+  } // while
+
+  // set up noise filter index limits
+  
+  _noiseIndexStart = _filtQueue.size() - 1;
+  _noiseIndexEnd = _filtQueue.size() - 1;
+  _nNoiseNodes = 0;
+  bool noiseFound = false;
+  for (size_t ii = 0; ii < _filtQueue.size(); ii++) {
+    RadxTime nodeTime = _filtQueue[ii].getTime();
+    if (nodeTime >= _noiseTimeStart && nodeTime <= _noiseTimeEnd) {
+      _nNoiseNodes++;
+      if (!noiseFound) {
+        _noiseIndexStart = ii;
+        noiseFound = true;
+      }
+      _noiseIndexEnd = ii;
+    }
+  }
+  _noiseIndexMid = (_noiseIndexStart + _noiseIndexEnd) / 2;
+  _noiseNodeMid = &_filtQueue[_noiseIndexMid];
+  
+  if (_noiseIndexStart < 2) {
+    return -1;
+  }
+
+  // compute wave filter index limits
+
+  FiltNode &oldest = _filtQueue[0];
+  _waveTimeStart = oldest.getTime();
+  _waveIndexStart = 0;
+  _waveIndexEnd = _noiseIndexStart - 1;
+  _waveTimeEnd = _filtQueue[_waveIndexEnd].getTime();
+  
+  // find the mid node closest to the mean time
+
+  double waveSecs = _waveTimeEnd - _waveTimeStart;
+  _waveTimeMean = _waveTimeEnd - waveSecs / 2.0;
+  double minTimeDiff = 1.0e99;
+  for (size_t ii = 0; ii < _filtQueue.size(); ii++) {
+    RadxTime nodeTime = _filtQueue[ii].getTime();
+    double timeDiff = fabs(_filtQueue[ii].getTime() - _waveTimeMean);
+    if (timeDiff < minTimeDiff) {
+      _waveIndexMid = ii;
+      _waveNodeMid = &_filtQueue[_waveIndexMid];
+      minTimeDiff = timeDiff;
+    }
+  }
+  _waveTimeMid = _waveNodeMid->getTime();
+  
+  return 0;
+  
+}
+
+//////////////////////////////////////////////////
+// run the noise filter
+
+void HcrVelCorrect::_runNoiseFilter()
+{
+
+  // get vector of surface velocities
+  
+  vector<double> velSurf;
+  for (size_t ii = _noiseIndexStart; ii <= _noiseIndexEnd; ii++) {
+    velSurf.push_back(_filtQueue[ii].velSurf);
+  }
+  
+  // compute the mean
+
+  double sum = 0.0;
+  double count = 0.0;
+  for (size_t ii = 0; ii < velSurf.size(); ii++) {
+    sum += velSurf[ii];
+    count++;
+  }
+
+  if (count < 1) {
+    _velIsValid = false;
+    return;
+  }
+
+  double mean = sum / count;
+
+  // compute the median
+  
+  sort(velSurf.begin(), velSurf.end());
+  int indexHalf = velSurf.size() / 2;
+  double median = velSurf[indexHalf];
+
+  // set the filtered value on all younger nodes
+
+  for (size_t ii = _noiseIndexMid; ii <= _noiseIndexEnd; ii++) {
+    _filtQueue[ii].velNoiseFiltMean = mean;
+    _filtQueue[ii].velNoiseFiltMedian = median;
+    _filtQueue[ii].velNoiseFilt = median;
+  }
+
+}
+
+//////////////////////////////////////////////////
+// run the wave filter
+
+void HcrVelCorrect::_runWaveFilter()
+{
+
+  // get vector of surface velocities
+
+  vector<double> velNoiseFilt;
+  vector<double> dtime;
+  RadxTime startTime = _filtQueue[0].getTime();
+  for (size_t ii = _waveIndexStart; ii <= _waveIndexEnd; ii++) {
+    velNoiseFilt.push_back(_filtQueue[ii].velNoiseFilt);
+    double deltaTime = _filtQueue[ii].getTime() - startTime;
+    dtime.push_back(deltaTime);
+  }
+  
+  // compute the mean
+  
+  double sum = 0.0;
+  double count = 0.0;
+  for (size_t ii = 0; ii < velNoiseFilt.size(); ii++) {
+    sum += velNoiseFilt[ii];
+    count++;
+  }
+
+  if (count < 1) {
+    _velIsValid = false;
+    return;
+  }
+
+  double mean = sum / count;
+  _waveNodeMid->velWaveFiltMean = mean;
+  for (size_t ii = _waveIndexMid; ii <= _waveIndexEnd; ii++) {
+    _filtQueue[ii].velWaveFiltMean = mean;
+  }
+
+  // perform the polynomial fit
+
+  _poly.clear();
+  _poly.setValues(dtime, velNoiseFilt);
+  if (_poly.performFit() == 0) {
+    for (size_t ii = _waveIndexMid; ii <= _waveIndexEnd; ii++) {
+      _filtQueue[ii].velWaveFiltPoly = _poly.getYEst(ii);
+    }
+  }
+
+  // compute the median
+
+  sort(velNoiseFilt.begin(), velNoiseFilt.end());
+  int indexHalf = velNoiseFilt.size() / 2;
+  double median = velNoiseFilt[indexHalf];
+  for (size_t ii = _waveIndexMid; ii <= _waveIndexEnd; ii++) {
+    _filtQueue[ii].velWaveFiltMedian = median;
+  }
+
+}
+
+//////////////////////////////////////////////////
+// add a ray to the filtered volume
+// write out the vol as needed
+
+void HcrVelCorrect::_addNodeRayToFiltVol(FiltNode &node)
+{
+  
+  // write out if latest time is past input file time
+  
+  RadxTime rayTime = node.ray->getRadxTime();
+  if ((_inputFileEndTime.size() > 0) &&
+      (rayTime > _inputFileEndTime[0])) {
+    _writeFiltVol();
+    _inputFileEndTime.pop_front();
+  }
+
+  // if not yet corrected, copy velocity in ray fields
+  
+  if (!node.corrected) {
+    _copyVelForRay(node.ray);
+  }
+  
+  // add to output vol
+  
+  _filtVol.addRay(node.ray);
+  
 }
 
 //////////////////////////////////////////////////
@@ -591,737 +1011,9 @@ void HcrVelCorrect::_setGlobalAttr(RadxVol &vol)
 }
 
 //////////////////////////////////////////////////
-// Run in FMQ mode
-
-int HcrVelCorrect::_runFmq()
-{
-
-  // Instantiate and initialize the input DsRadar queue and message
-  
-  if (_params.seek_to_end_of_input_fmq) {
-    if (_inputFmq.init(_params.input_fmq_url, _progName.c_str(),
-                       _params.debug >= Params::DEBUG_VERBOSE,
-                       DsFmq::BLOCKING_READ_WRITE, DsFmq::END )) {
-      fprintf(stderr, "ERROR - %s:Dsr2Radx::_run\n", _progName.c_str());
-      fprintf(stderr, "Could not initialize radar queue '%s'\n",
-	      _params.input_fmq_url);
-      return -1;
-    }
-  } else {
-    if (_inputFmq.init(_params.input_fmq_url, _progName.c_str(),
-                       _params.debug >= Params::DEBUG_VERBOSE,
-                       DsFmq::BLOCKING_READ_WRITE, DsFmq::START )) {
-      fprintf(stderr, "ERROR - %s:Dsr2Radx::_run\n", _progName.c_str());
-      fprintf(stderr, "Could not initialize radar queue '%s'\n",
-	      _params.input_fmq_url);
-      return -1;
-    }
-  }
-
-  // create the output FMQ
-  
-  if (_outputFmq.init(_params.output_fmq_url,
-                      _progName.c_str(),
-                      _params.debug >= Params::DEBUG_VERBOSE,
-                      DsFmq::READ_WRITE, DsFmq::END,
-                      _params.output_fmq_compress,
-                      _params.output_fmq_n_slots,
-                      _params.output_fmq_buf_size)) {
-    cerr << "WARNING - trying to create new fmq" << endl;
-    if (_outputFmq.init(_params.output_fmq_url,
-                        _progName.c_str(),
-                        _params.debug >= Params::DEBUG_VERBOSE,
-                        DsFmq::CREATE, DsFmq::START,
-                        _params.output_fmq_compress,
-                        _params.output_fmq_n_slots,
-                        _params.output_fmq_buf_size)) {
-      cerr << "ERROR - Radx2Dsr" << endl;
-      cerr << "  Cannot open fmq, URL: " << _params.output_fmq_url << endl;
-      return -1;
-    }
-  }
-  
-  if (_params.output_fmq_compress) {
-    _outputFmq.setCompressionMethod(TA_COMPRESSION_GZIP);
-  }
-  
-  if (_params.output_fmq_write_blocking) {
-    _outputFmq.setBlockingWrite();
-  }
-  if (_params.output_fmq_data_mapper_report_interval > 0) {
-    _outputFmq.setRegisterWithDmap
-      (true, _params.output_fmq_data_mapper_report_interval);
-  }
-
-  // read messages from the queue and process them
-  
-  _nRaysRead = 0;
-  _nRaysWritten = 0;
-  _needWriteParams = false;
-  RadxTime prevDwellRayTime;
-  int iret = 0;
-  while (true) {
-
-    PMU_auto_register("Reading FMQ");
-
-    RadxRay *ray = _readFmqRay();
-    if (ray == NULL) {
-      umsleep(100);
-      continue;
-    }
-
-    // process this ray
-
-    if (_surfVel.processRay(ray) == 0) {
-    
-      // write params if needed
-      
-      if (_needWriteParams) {
-        if (_writeParams(ray)) {
-          return -1; 
-        }
-        _needWriteParams = false;
-      }
-      
-      // write out ray
-      
-      _writeRay(ray);
-
-    } // if (_surfVel.processRay(ray) == 0)
-
-  } // while (true)
-  
-  return iret;
-
-}
-
-////////////////////////////////////////////////////////////////////
-// _readFmqRay()
-//
-// Read a ray from the FMQ, setting the flags about ray_data
-// and _endOfVolume appropriately.
-//
-// Returns the ray on success, NULL on failure
-// ray must be freed by caller.
-
-RadxRay *HcrVelCorrect::_readFmqRay() 
-  
-{
-  
-  while (true) {
-
-    PMU_auto_register("Reading radar queue");
-
-    bool gotMsg = false;
-    _inputContents = 0;
-    if (_inputFmq.getDsMsg(_inputMsg, &_inputContents, &gotMsg)) {
-      return NULL;
-    }
-    if (!gotMsg) {
-      return NULL;
-    }
-    
-    // set radar parameters if avaliable
-    
-    if (_inputContents & DsRadarMsg::RADAR_PARAMS) {
-      _loadRadarParams();
-      _needWriteParams = true;
-    }
-    
-    // pass message through if not related to beam
-    
-    if (!(_inputContents & DsRadarMsg::RADAR_BEAM) &&
-        !(_inputContents & DsRadarMsg::RADAR_PARAMS) &&
-        !(_inputContents & DsRadarMsg::PLATFORM_GEOREF)) {
-      if(_outputFmq.putDsMsg(_inputMsg, _inputContents)) {
-        cerr << "ERROR - HcrVelCorrect::_runFmq()" << endl;
-        cerr << "  Cannot copy message to output queue" << endl;
-        cerr << "  URL: " << _params.output_fmq_url << endl;
-        return NULL;
-      }
-    }
-
-    // If we have radar and field params, and there is good ray data,
-    
-    if ((_inputContents & DsRadarMsg::RADAR_BEAM) && _inputMsg.allParamsSet()) {
-        
-      _nRaysRead++;
-      
-      // crete ray from ray message
-      
-      RadxRay *ray = _createInputRay();
-      
-      // debug print
-      
-      if (_params.debug) {
-        if ((_nRaysRead > 0) && (_nRaysRead % 360 == 0)) {
-          cerr << "==>>    read nRays, latest time, el, az: "
-               << _nRaysRead << ", "
-               << utimstr(ray->getTimeSecs()) << ", "
-               << ray->getElevationDeg() << ", "
-               << ray->getAzimuthDeg() << endl;
-        }
-      }
-      
-      // process that ray
-      
-      return ray;
-      
-    } // if (_inputContents ...
-
-  } // while
-  
-  return NULL;
-
-}
-
-////////////////////////////////////////////////////////////////
-// load radar params
-
-void HcrVelCorrect::_loadRadarParams()
-
-{
-  
-  if (_params.debug >= Params::DEBUG_EXTRA) {
-    cerr << "=========>> got RADAR_PARAMS" << endl;
-  }
-
-  _rparams = _inputMsg.getRadarParams();
-  
-  _filtVol.setInstrumentName(_rparams.radarName);
-  _filtVol.setScanName(_rparams.scanTypeName);
-  
-  switch (_rparams.radarType) {
-    case DS_RADAR_AIRBORNE_FORE_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_FIXED);
-      break;
-    }
-    case DS_RADAR_AIRBORNE_AFT_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_AIRCRAFT_FORE);
-      break;
-    }
-    case DS_RADAR_AIRBORNE_TAIL_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_AIRCRAFT_TAIL);
-      break;
-    }
-    case DS_RADAR_AIRBORNE_LOWER_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_AIRCRAFT_BELLY);
-      break;
-    }
-    case DS_RADAR_AIRBORNE_UPPER_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_AIRCRAFT_ROOF);
-      break;
-    }
-    case DS_RADAR_SHIPBORNE_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_SHIP);
-      break;
-    }
-    case DS_RADAR_VEHICLE_TYPE: {
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_VEHICLE);
-      break;
-    }
-    case DS_RADAR_GROUND_TYPE:
-    default:{
-      _filtVol.setPlatformType(Radx::PLATFORM_TYPE_FIXED);
-    }
-  }
-  
-  _filtVol.setLocation(_rparams.latitude,
-                        _rparams.longitude,
-                        _rparams.altitude);
-
-  _filtVol.addWavelengthCm(_rparams.wavelength);
-  _filtVol.setRadarBeamWidthDegH(_rparams.horizBeamWidth);
-  _filtVol.setRadarBeamWidthDegV(_rparams.vertBeamWidth);
-
-}
-
-////////////////////////////////////////////////////////////////////
-// add an input ray from an incoming message
-
-RadxRay *HcrVelCorrect::_createInputRay()
-
-{
-
-  // input data
-
-  const DsRadarBeam &rbeam = _inputMsg.getRadarBeam();
-  const DsRadarParams &rparams = _inputMsg.getRadarParams();
-  const vector<DsFieldParams *> &fparamsVec = _inputMsg.getFieldParams();
-
-  // create new ray
-
-  RadxRay *ray = new RadxRay;
-
-  // set ray properties
-
-  ray->setTime(rbeam.dataTime, rbeam.nanoSecs);
-  ray->setVolumeNumber(rbeam.volumeNum);
-  ray->setSweepNumber(rbeam.tiltNum);
-
-  int scanMode = rparams.scanMode;
-  if (rbeam.scanMode > 0) {
-    scanMode = rbeam.scanMode;
-  } else {
-    scanMode = rparams.scanMode;
-  }
-
-  ray->setSweepMode(_getRadxSweepMode(scanMode));
-  ray->setPolarizationMode(_getRadxPolarizationMode(rparams.polarization));
-  ray->setPrtMode(_getRadxPrtMode(rparams.prfMode));
-  ray->setFollowMode(_getRadxFollowMode(rparams.followMode));
-
-  double elev = rbeam.elevation;
-  if (elev > 180) {
-    elev -= 360.0;
-  }
-  ray->setElevationDeg(elev);
-
-  double az = rbeam.azimuth;
-  if (az < 0) {
-    az += 360.0;
-  }
-  ray->setAzimuthDeg(az);
-
-  // range geometry
-
-  int nGates = rparams.numGates;
-  ray->setRangeGeom(rparams.startRange, rparams.gateSpacing);
-
-  if (scanMode == DS_RADAR_RHI_MODE ||
-      scanMode == DS_RADAR_EL_SURV_MODE) {
-    ray->setFixedAngleDeg(rbeam.targetAz);
-  } else {
-    ray->setFixedAngleDeg(rbeam.targetElev);
-  }
-
-  ray->setIsIndexed(rbeam.beamIsIndexed);
-  ray->setAngleResDeg(rbeam.angularResolution);
-  ray->setAntennaTransition(rbeam.antennaTransition);
-  ray->setNSamples(rparams.samplesPerBeam);
-  
-  ray->setPulseWidthUsec(rparams.pulseWidth);
-  double prt = 1.0 / rparams.pulseRepFreq;
-  ray->setPrtSec(prt);
-  ray->setPrtRatio(1.0);
-  ray->setNyquistMps(rparams.unambigVelocity);
-
-  ray->setUnambigRangeKm(Radx::missingMetaDouble);
-  ray->setUnambigRange();
-
-  ray->setMeasXmitPowerDbmH(rbeam.measXmitPowerDbmH);
-  ray->setMeasXmitPowerDbmV(rbeam.measXmitPowerDbmV);
-
-  // platform georeference
-  
-  if (_inputContents & DsRadarMsg::PLATFORM_GEOREF) {
-    const DsPlatformGeoref &platformGeoref = _inputMsg.getPlatformGeoref();
-    const ds_iwrf_platform_georef_t &dsGeoref = platformGeoref.getGeoref();
-    _georefs.push_back(platformGeoref);
-    RadxGeoref georef;
-    georef.setTimeSecs(dsGeoref.packet.time_secs_utc);
-    georef.setNanoSecs(dsGeoref.packet.time_nano_secs);
-    georef.setLongitude(dsGeoref.longitude);
-    georef.setLatitude(dsGeoref.latitude);
-    georef.setAltitudeKmMsl(dsGeoref.altitude_msl_km);
-    georef.setAltitudeKmAgl(dsGeoref.altitude_agl_km);
-    georef.setEwVelocity(dsGeoref.ew_velocity_mps);
-    georef.setNsVelocity(dsGeoref.ns_velocity_mps);
-    georef.setVertVelocity(dsGeoref.vert_velocity_mps);
-    georef.setHeading(dsGeoref.heading_deg);
-    georef.setRoll(dsGeoref.roll_deg);
-    georef.setPitch(dsGeoref.pitch_deg);
-    georef.setDrift(dsGeoref.drift_angle_deg);
-    georef.setRotation(dsGeoref.rotation_angle_deg);
-    georef.setTilt(dsGeoref.tilt_angle_deg);
-    georef.setEwWind(dsGeoref.ew_horiz_wind_mps);
-    georef.setNsWind(dsGeoref.ns_horiz_wind_mps);
-    georef.setVertWind(dsGeoref.vert_wind_mps);
-    georef.setHeadingRate(dsGeoref.heading_rate_dps);
-    georef.setPitchRate(dsGeoref.pitch_rate_dps);
-    georef.setDriveAngle1(dsGeoref.drive_angle_1_deg);
-    georef.setDriveAngle2(dsGeoref.drive_angle_2_deg);
-    ray->clearGeoref();
-    ray->setGeoref(georef);
-  }
-
-  // load up fields
-
-  int byteWidth = rbeam.byteWidth;
-  
-  for (size_t iparam = 0; iparam < fparamsVec.size(); iparam++) {
-
-    // is this an output field or censoring field?
-
-    const DsFieldParams &fparams = *fparamsVec[iparam];
-    string fieldName = fparams.name;
-    // if (_params.set_output_fields && !_isOutputField(fieldName)) {
-    //   continue;
-    // }
-
-    // convert to floats
-    
-    Radx::fl32 *fdata = new Radx::fl32[nGates];
-
-    if (byteWidth == sizeof(fl32)) {
-
-      fl32 *inData = (fl32 *) rbeam.data() + iparam;
-      fl32 inMissing = (fl32) fparams.missingDataValue;
-      Radx::fl32 *outData = fdata;
-      
-      for (int igate = 0; igate < nGates;
-           igate++, inData += fparamsVec.size(), outData++) {
-        fl32 inVal = *inData;
-        if (inVal == inMissing) {
-          *outData = Radx::missingFl32;
-        } else {
-          *outData = *inData;
-        }
-      } // igate
-
-    } else if (byteWidth == sizeof(ui16)) {
-
-      ui16 *inData = (ui16 *) rbeam.data() + iparam;
-      ui16 inMissing = (ui16) fparams.missingDataValue;
-      double scale = fparams.scale;
-      double bias = fparams.bias;
-      Radx::fl32 *outData = fdata;
-      
-      for (int igate = 0; igate < nGates;
-           igate++, inData += fparamsVec.size(), outData++) {
-        ui16 inVal = *inData;
-        if (inVal == inMissing) {
-          *outData = Radx::missingFl32;
-        } else {
-          *outData = *inData * scale + bias;
-        }
-      } // igate
-
-    } else {
-
-      // byte width 1
-
-      ui08 *inData = (ui08 *) rbeam.data() + iparam;
-      ui08 inMissing = (ui08) fparams.missingDataValue;
-      double scale = fparams.scale;
-      double bias = fparams.bias;
-      Radx::fl32 *outData = fdata;
-      
-      for (int igate = 0; igate < nGates;
-           igate++, inData += fparamsVec.size(), outData++) {
-        ui08 inVal = *inData;
-        if (inVal == inMissing) {
-          *outData = Radx::missingFl32;
-        } else {
-          *outData = *inData * scale + bias;
-        }
-      } // igate
-
-    } // if (byteWidth == 4)
-
-    RadxField *field = new RadxField(fparams.name, fparams.units);
-    field->copyRangeGeom(*ray);
-    field->setTypeFl32(Radx::missingFl32);
-    field->addDataFl32(nGates, fdata);
-
-    ray->addField(field);
-
-    delete[] fdata;
-
-  } // iparam
-
-  return ray;
-
-}
-
-//////////////////////////////////////////////////
-// write radar and field parameters
-
-int HcrVelCorrect::_writeParams(const RadxRay *ray)
-
-{
-
-  // radar parameters
-  
-  DsRadarMsg msg;
-  DsRadarParams &rparams = msg.getRadarParams();
-  rparams = _rparams;
-  rparams.numFields = ray->getNFields();
-  
-  // field parameters - all fields are fl32
-  
-  vector<DsFieldParams* > &fieldParams = msg.getFieldParams();
-  
-  for (int ifield = 0; ifield < (int) ray->getNFields(); ifield++) {
-    
-    const RadxField &fld = *ray->getFields()[ifield];
-    double dsScale = 1.0, dsBias = 0.0;
-    int dsMissing = (int) floor(fld.getMissingFl32() + 0.5);
-    
-    DsFieldParams *fParams = new DsFieldParams(fld.getName().c_str(),
-                                               fld.getUnits().c_str(),
-                                               dsScale, dsBias, sizeof(fl32),
-                                               dsMissing);
-    fieldParams.push_back(fParams);
-    if (_params.debug >= Params::DEBUG_VERBOSE) {
-      fParams->print(cerr);
-    }
-
-  } // ifield
-
-  // put params
-  
-  int content = DsRadarMsg::FIELD_PARAMS | DsRadarMsg::RADAR_PARAMS;
-  if(_outputFmq.putDsMsg(msg, content)) {
-    cerr << "ERROR - HcrVelCorrect::_writeParams()" << endl;
-    cerr << "  Cannot write field params to FMQ" << endl;
-    cerr << "  URL: " << _params.output_fmq_url << endl;
-    return -1;
-  }
-        
-  return 0;
-
-}
-
-//////////////////////////////////////////////////
-// write ray
-
-int HcrVelCorrect::_writeRay(const RadxRay *ray)
-  
-{
-
-  // write params if needed
-
-  int nGates = ray->getNGates();
-  const vector<RadxField *> &fields = ray->getFields();
-  int nFields = ray->getNFields();
-  int nPoints = nGates * nFields;
-  
-  // meta-data
-  
-  DsRadarMsg msg;
-  DsRadarBeam &beam = msg.getRadarBeam();
-
-  beam.dataTime = ray->getTimeSecs();
-  beam.nanoSecs = (int) (ray->getNanoSecs() + 0.5);
-  beam.referenceTime = 0;
-
-  beam.byteWidth = sizeof(fl32); // fl32
-
-  beam.volumeNum = ray->getVolumeNumber();
-  beam.tiltNum = ray->getSweepNumber();
-  Radx::SweepMode_t sweepMode = ray->getSweepMode();
-  beam.scanMode = _getDsScanMode(sweepMode);
-  beam.antennaTransition = ray->getAntennaTransition();
-  
-  beam.azimuth = ray->getAzimuthDeg();
-  beam.elevation = ray->getElevationDeg();
-  
-  if (sweepMode == Radx::SWEEP_MODE_RHI ||
-      sweepMode == Radx::SWEEP_MODE_MANUAL_RHI) {
-    beam.targetAz = ray->getFixedAngleDeg();
-  } else {
-    beam.targetElev = ray->getFixedAngleDeg();
-  }
-
-  beam.beamIsIndexed = ray->getIsIndexed();
-  beam.angularResolution = ray->getAngleResDeg();
-  beam.nSamples = ray->getNSamples();
-
-  beam.measXmitPowerDbmH = ray->getMeasXmitPowerDbmH();
-  beam.measXmitPowerDbmV = ray->getMeasXmitPowerDbmV();
-
-  // 4-byte floats
-  
-  fl32 *data = new fl32[nPoints];
-  for (int ifield = 0; ifield < nFields; ifield++) {
-    fl32 *dd = data + ifield;
-    const RadxField *fld = fields[ifield];
-    const Radx::fl32 *fd = (Radx::fl32 *) fld->getData();
-    if (fd == NULL) {
-      cerr << "ERROR - Radx2Dsr::_writeBeam" << endl;
-      cerr << "  NULL data pointer, field name, elev, az: "
-           << fld->getName() << ", "
-           << ray->getElevationDeg() << ", "
-           << ray->getAzimuthDeg() << endl;
-      delete[] data;
-      return -1;
-    }
-    for (int igate = 0; igate < nGates; igate++, dd += nFields, fd++) {
-      *dd = *fd;
-    }
-  }
-  beam.loadData(data, nPoints * sizeof(fl32), sizeof(fl32));
-  delete[] data;
-    
-  if (_params.debug >= Params::DEBUG_VERBOSE) {
-    beam.print(cerr);
-  }
-  
-  // add georeference if applicable
-
-  int contents = (int) DsRadarMsg::RADAR_BEAM;
-  if (_georefs.size() > 0) {
-    DsPlatformGeoref &georef = msg.getPlatformGeoref();
-    // use mid georef
-    georef = _georefs[_georefs.size() / 2];
-    contents |= DsRadarMsg::PLATFORM_GEOREF;
-  }
-    
-  // put beam
-  
-  if(_outputFmq.putDsMsg(msg, contents)) {
-    cerr << "ERROR - HcrVelCorrect::_writeBeam()" << endl;
-    cerr << "  Cannot write beam to FMQ" << endl;
-    cerr << "  URL: " << _params.output_fmq_url << endl;
-    return -1;
-  }
-
-  // debug print
-  
-  _nRaysWritten++;
-  if (_params.debug) {
-    if (_nRaysWritten % 100 == 0) {
-      cerr << "====>> wrote nRays, latest time, el, az: "
-           << _nRaysWritten << ", "
-           << utimstr(ray->getTimeSecs()) << ", "
-           << ray->getElevationDeg() << ", "
-           << ray->getAzimuthDeg() << endl;
-    }
-  }
-  
-  return 0;
-
-}
-
-/////////////////////////////////////////////
-// convert from DsrRadar enums to Radx enums
-
-Radx::SweepMode_t HcrVelCorrect::_getRadxSweepMode(int dsrScanMode)
-
-{
-
-  switch (dsrScanMode) {
-    case DS_RADAR_SECTOR_MODE:
-    case DS_RADAR_FOLLOW_VEHICLE_MODE:
-      return Radx::SWEEP_MODE_SECTOR;
-    case DS_RADAR_COPLANE_MODE:
-      return Radx::SWEEP_MODE_COPLANE;
-    case DS_RADAR_RHI_MODE:
-      return Radx::SWEEP_MODE_RHI;
-    case DS_RADAR_VERTICAL_POINTING_MODE:
-      return Radx::SWEEP_MODE_VERTICAL_POINTING;
-    case DS_RADAR_MANUAL_MODE:
-      return Radx::SWEEP_MODE_POINTING;
-    case DS_RADAR_SURVEILLANCE_MODE:
-      return Radx::SWEEP_MODE_AZIMUTH_SURVEILLANCE;
-    case DS_RADAR_EL_SURV_MODE:
-      return Radx::SWEEP_MODE_ELEVATION_SURVEILLANCE;
-    case DS_RADAR_SUNSCAN_MODE:
-      return Radx::SWEEP_MODE_SUNSCAN;
-    case DS_RADAR_SUNSCAN_RHI_MODE:
-      return Radx::SWEEP_MODE_SUNSCAN_RHI;
-    case DS_RADAR_POINTING_MODE:
-      return Radx::SWEEP_MODE_POINTING;
-    default:
-      return Radx::SWEEP_MODE_AZIMUTH_SURVEILLANCE;
-  }
-}
-
-Radx::PolarizationMode_t HcrVelCorrect::_getRadxPolarizationMode(int dsrPolMode)
-
-{
-  switch (dsrPolMode) {
-    case DS_POLARIZATION_HORIZ_TYPE:
-      return Radx::POL_MODE_HORIZONTAL;
-    case DS_POLARIZATION_VERT_TYPE:
-      return Radx::POL_MODE_VERTICAL;
-    case DS_POLARIZATION_DUAL_TYPE:
-      return Radx::POL_MODE_HV_SIM;
-    case DS_POLARIZATION_DUAL_HV_ALT:
-      return Radx::POL_MODE_HV_ALT;
-    case DS_POLARIZATION_DUAL_HV_SIM:
-      return Radx::POL_MODE_HV_SIM;
-    case DS_POLARIZATION_RIGHT_CIRC_TYPE:
-    case DS_POLARIZATION_LEFT_CIRC_TYPE:
-      return Radx::POL_MODE_CIRCULAR;
-    case DS_POLARIZATION_ELLIPTICAL_TYPE:
-    default:
-      return Radx::POL_MODE_HORIZONTAL;
-  }
-}
-
-Radx::FollowMode_t HcrVelCorrect::_getRadxFollowMode(int dsrMode)
-
-{
-  switch (dsrMode) {
-    case DS_RADAR_FOLLOW_MODE_SUN:
-      return Radx::FOLLOW_MODE_SUN;
-    case DS_RADAR_FOLLOW_MODE_VEHICLE:
-      return Radx::FOLLOW_MODE_VEHICLE;
-    case DS_RADAR_FOLLOW_MODE_AIRCRAFT:
-      return Radx::FOLLOW_MODE_AIRCRAFT;
-    case DS_RADAR_FOLLOW_MODE_TARGET:
-      return Radx::FOLLOW_MODE_TARGET;
-    case DS_RADAR_FOLLOW_MODE_MANUAL:
-      return Radx::FOLLOW_MODE_MANUAL;
-    default:
-      return Radx::FOLLOW_MODE_NONE;
-  }
-}
-
-Radx::PrtMode_t HcrVelCorrect::_getRadxPrtMode(int dsrMode)
-
-{
-  switch (dsrMode) {
-    case DS_RADAR_PRF_MODE_FIXED:
-      return Radx::PRT_MODE_FIXED;
-    case DS_RADAR_PRF_MODE_STAGGERED_2_3:
-    case DS_RADAR_PRF_MODE_STAGGERED_3_4:
-    case DS_RADAR_PRF_MODE_STAGGERED_4_5:
-      return Radx::PRT_MODE_STAGGERED;
-    default:
-      return Radx::PRT_MODE_FIXED;
-  }
-}
-
-//////////////////////////////////////////////////
-// get Dsr enums from Radx enums
-
-int HcrVelCorrect::_getDsScanMode(Radx::SweepMode_t mode)
-
-{
-  switch (mode) {
-    case Radx::SWEEP_MODE_SECTOR:
-      return DS_RADAR_SECTOR_MODE;
-    case Radx::SWEEP_MODE_COPLANE:
-      return DS_RADAR_COPLANE_MODE;
-    case Radx::SWEEP_MODE_RHI:
-      return DS_RADAR_RHI_MODE;
-    case Radx::SWEEP_MODE_VERTICAL_POINTING:
-      return DS_RADAR_VERTICAL_POINTING_MODE;
-    case Radx::SWEEP_MODE_IDLE:
-      return DS_RADAR_IDLE_MODE;
-    case Radx::SWEEP_MODE_ELEVATION_SURVEILLANCE:
-      return DS_RADAR_SURVEILLANCE_MODE;
-    case Radx::SWEEP_MODE_SUNSCAN:
-      return DS_RADAR_SUNSCAN_MODE;
-    case Radx::SWEEP_MODE_POINTING:
-      return DS_RADAR_POINTING_MODE;
-    case Radx::SWEEP_MODE_MANUAL_PPI:
-      return DS_RADAR_MANUAL_MODE;
-    case Radx::SWEEP_MODE_MANUAL_RHI:
-      return DS_RADAR_MANUAL_MODE;
-    case Radx::SWEEP_MODE_AZIMUTH_SURVEILLANCE:
-    default:
-      return DS_RADAR_SURVEILLANCE_MODE;
-  }
-}
-
-//////////////////////////////////////////////////
 // correct velocity on ray
 
-void HcrVelCorrect::_correctVelForRay(RadxRay *ray, double surfVel)
+void HcrVelCorrect::_correctVelForRay(RadxRay *ray, double surfFilt)
 
 {
 
@@ -1348,7 +1040,7 @@ void HcrVelCorrect::_correctVelForRay(RadxRay *ray, double surfVel)
   Radx::fl32 *corrected = new Radx::fl32[velField->getNPoints()];
   for (size_t ii = 0; ii < velField->getNPoints(); ii++) {
     if (vel[ii] != miss) {
-      corrected[ii] = vel[ii] - surfVel;
+      corrected[ii] = vel[ii] - surfFilt;
     } else {
       corrected[ii] = miss;
     }
@@ -1376,7 +1068,8 @@ void HcrVelCorrect::_copyVelForRay(RadxRay *ray)
   if (velField == NULL) {
     // no vel field, nothing to do
     if (_params.debug >= Params::DEBUG_VERBOSE) {
-      cerr << "WARNING - no vel field found: " << _params.vel_field_name << endl;
+      cerr << "WARNING - no vel field found: "
+           << _params.vel_field_name << endl;
     }
     return;
   }
@@ -1405,5 +1098,155 @@ void HcrVelCorrect::_copyVelForRay(RadxRay *ray)
 
   ray->addField(copyField);
 
+}
+
+
+//////////////////////////////////////////////////
+// write wave filter results to SPDB in XML
+
+void HcrVelCorrect::_writeWaveFiltResultsToSpdb(const RadxRay *filtRay)
+  
+{
+
+  // check if we have a good velocity
+  
+  if (_waveNodeMid == NULL || !_waveNodeMid->velIsValid) {
+    return;
+  }
+  
+  // form XML string
+
+  string xml;
+  xml += RadxXml::writeStartTag("HcrVelCorr", 0);
+
+  xml += RadxXml::writeDouble("VelSurf", 1,
+                              _waveNodeMid->velSurf);
+  xml += RadxXml::writeDouble("DbzSurf", 1,
+                              _waveNodeMid->dbzSurf);
+  xml += RadxXml::writeDouble("RangeToSurf",
+                              1, _waveNodeMid->rangeToSurf);
+  
+  xml += RadxXml::writeDouble("VelNoiseFilt", 1,
+                              _waveNodeMid->velNoiseFilt);
+  xml += RadxXml::writeDouble("VelNoiseFiltMean", 1,
+                              _waveNodeMid->velNoiseFiltMean);
+  xml += RadxXml::writeDouble("VelNoiseFiltMedian", 1,
+                              _waveNodeMid->velNoiseFiltMedian);
+  xml += RadxXml::writeDouble("VelWaveFiltMean", 1,
+                              _waveNodeMid->velWaveFiltMean);
+  xml += RadxXml::writeDouble("VelWaveFiltMedian", 1,
+                              _waveNodeMid->velWaveFiltMedian);
+  xml += RadxXml::writeDouble("VelWaveFiltPoly", 1,
+                              _waveNodeMid->velWaveFiltPoly);
+  
+  double velCorr = _waveNodeMid->velSurf - _velFilt;
+  xml += RadxXml::writeDouble("VelCorr", 1, velCorr);
+  
+  const RadxGeoref *georef = filtRay->getGeoreference();
+  if (georef != NULL) {
+    xml += RadxXml::writeDouble("Altitude", 1, georef->getAltitudeKmMsl());
+    xml += RadxXml::writeDouble("VertVel", 1, georef->getVertVelocity());
+    xml += RadxXml::writeDouble("Roll", 1, georef->getRoll());
+    xml += RadxXml::writeDouble("Pitch", 1, georef->getPitch());
+    xml += RadxXml::writeDouble("Rotation", 1, georef->getRotation());
+    xml += RadxXml::writeDouble("Tilt", 1, georef->getTilt());
+    xml += RadxXml::writeDouble("Elevation", 1, filtRay->getElevationDeg());
+    xml += RadxXml::writeDouble("DriveAngle1", 1, georef->getDriveAngle1());
+    xml += RadxXml::writeDouble("DriveAngle2", 1, georef->getDriveAngle2());
+  }
+  
+  xml += RadxXml::writeEndTag("HcrVelCorr", 0);
+  
+  // write to SPDB
+
+  DsSpdb spdb;
+  time_t validTime = filtRay->getTimeSecs();
+  spdb.addPutChunk(0, validTime, validTime, xml.size() + 1, xml.c_str());
+  if (spdb.put(_params.surface_vel_results_spdb_output_url,
+               SPDB_XML_ID, SPDB_XML_LABEL)) {
+    cerr << "ERROR - HcrVelCorrect::_writeWaveFiltResultsToSpdb" << endl;
+    cerr << spdb.getErrStr() << endl;
+    return;
+  }
+  
+  if (_params.debug >= Params::DEBUG_EXTRA) {
+    cerr << "Wrote HCR wave filt vel correction results to spdb, url: " 
+         << _params.surface_vel_results_spdb_output_url << endl;
+    cerr << "=====================================" << endl;
+    cerr << xml;
+    cerr << "=====================================" << endl;
+  }
+ 
+}
+
+//////////////////////////////////////////////////
+// write FIR filt results to SPDB in XML
+
+void HcrVelCorrect::_writeFirFiltResultsToSpdb(const RadxRay *filtRay)
+  
+{
+
+  // check if we have a good velocity
+  
+  if (!_firFilt.velocityIsValid()) {
+    return;
+  }
+  
+  // form XML string
+
+  string xml;
+  xml += RadxXml::writeStartTag("HcrVelCorr", 0);
+
+  xml += RadxXml::writeDouble("VelSurf", 1,
+                              _firFilt.getVelMeasured());
+  xml += RadxXml::writeDouble("DbzSurf", 1,
+                              _firFilt.getDbzSurf());
+  xml += RadxXml::writeDouble("RangeToSurf", 1,
+                              _firFilt.getRangeToSurface());
+  xml += RadxXml::writeDouble("VelStage1", 1,
+                              _firFilt.getVelStage1());
+  xml += RadxXml::writeDouble("VelSpike", 1,
+                              _firFilt.getVelSpike());
+  xml += RadxXml::writeDouble("VelCond", 1,
+                              _firFilt.getVelCond());
+  xml += RadxXml::writeDouble("VelFilt", 1,
+                              _firFilt.getVelFilt());
+  double velCorr = _firFilt.getVelMeasured() - _velFilt;
+  xml += RadxXml::writeDouble("VelCorr", 1, velCorr);
+  
+  const RadxGeoref *georef = filtRay->getGeoreference();
+  if (georef != NULL) {
+    xml += RadxXml::writeDouble("Altitude", 1, georef->getAltitudeKmMsl());
+    xml += RadxXml::writeDouble("VertVel", 1, georef->getVertVelocity());
+    xml += RadxXml::writeDouble("Roll", 1, georef->getRoll());
+    xml += RadxXml::writeDouble("Pitch", 1, georef->getPitch());
+    xml += RadxXml::writeDouble("Rotation", 1, georef->getRotation());
+    xml += RadxXml::writeDouble("Tilt", 1, georef->getTilt());
+    xml += RadxXml::writeDouble("DriveAngle1", 1, georef->getDriveAngle1());
+    xml += RadxXml::writeDouble("DriveAngle2", 1, georef->getDriveAngle2());
+  }
+
+  xml += RadxXml::writeEndTag("HcrVelCorr", 0);
+
+  // write to SPDB
+  
+  DsSpdb spdb;
+  time_t validTime = filtRay->getTimeSecs();
+  spdb.addPutChunk(0, validTime, validTime, xml.size() + 1, xml.c_str());
+  if (spdb.put(_params.surface_vel_results_spdb_output_url,
+               SPDB_XML_ID, SPDB_XML_LABEL)) {
+    cerr << "ERROR - HcrVelCorrect::_writeFirFiltResultsToSpdb" << endl;
+    cerr << spdb.getErrStr() << endl;
+    return;
+  }
+  
+  if (_params.debug >= Params::DEBUG_EXTRA) {
+    cerr << "Wrote HCR FIR filtering vel correction results to spdb, url: " 
+         << _params.surface_vel_results_spdb_output_url << endl;
+    cerr << "=====================================" << endl;
+    cerr << xml;
+    cerr << "=====================================" << endl;
+  }
+ 
 }
 

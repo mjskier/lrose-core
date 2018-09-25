@@ -22,25 +22,23 @@
 // ** WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.    
 // *=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=* 
 //////////////////////////////////////////////////////////////////////////
-// FindSurfaceVel.cc
+// HcrVelFirFilt.cc
 //
 // Mike Dixon, EOL, NCAR, P.O.Box 3000, Boulder, CO, 80307-3000, USA
 //
-// October 2016
+// Sept 2018
 //
 //////////////////////////////////////////////////////////////////////////
 //
-// FindSurfaceVel is intended for use with downward-pointing airborne
-// Doppler radars.
+// HcrVelFirFilt filters surface velocity as estimated by the class
+// HcrSurfaceVel.
 //
-// FindSurfaceVel reads in Radx moments, computes the apparent velocity
-// of the ground echo, and filters the apparent velocity in time to remove
-// spurious spikes.
+// It applies FIR filtering to the velocity of the surface echo.
 //
 //////////////////////////////////////////////////////////////////////////
 
 #include <cmath>
-#include <radar/FindSurfaceVel.hh>
+#include <radar/HcrVelFirFilt.hh>
 #include <Radx/RadxRay.hh>
 #include <Radx/RadxGeoref.hh>
 #include <Radx/RadxTimeList.hh>
@@ -49,7 +47,7 @@ using namespace std;
 // Coefficients for stage-1 FIR filter.
 // Initial filtering step. This is normally a 21-point FIR filter.
 
-const double FindSurfaceVel::stage1FilterDefault[Stage1FilterDefaultLen] = {
+const double HcrVelFirFilt::stage1FilterDefault[Stage1FilterDefaultLen] = {
   1.6976992e-02, 2.3294990e-02, 3.0244475e-02, 3.7550056e-02, 4.4888313e-02,
   5.1908191e-02, 5.8254533e-02, 6.3592862e-02, 6.7633391e-02, 7.0152222e-02,
   7.1007947e-02, 7.0152222e-02, 6.7633391e-02, 6.3592862e-02, 5.8254533e-02,
@@ -62,7 +60,7 @@ const double FindSurfaceVel::stage1FilterDefault[Stage1FilterDefaultLen] = {
 // five times in succession on a time series.
 // Normally this will have 101 entries.
 
-const double FindSurfaceVel::spikeFilterDefault[SpikeFilterDefaultLen] = {
+const double HcrVelFirFilt::spikeFilterDefault[SpikeFilterDefaultLen] = {
   1.4102747e-09, 9.6755464e-09, 3.9114620e-08, 1.2097842e-07, 3.1591184e-07,
   7.3214001e-07, 1.5507567e-06, 3.0594395e-06, 5.6957251e-06, 1.0100617e-05,
   1.7182765e-05, 2.8192724e-05, 4.4805905e-05, 6.9211797e-05, 1.0420588e-04,
@@ -91,7 +89,7 @@ const double FindSurfaceVel::spikeFilterDefault[SpikeFilterDefaultLen] = {
 // If this difference exceeds _spikeFilterDifferenceThreshold we use the spike
 // filter result. Otherwise we use the stage-1 result.
 
-const double FindSurfaceVel::finalFilterDefault[FinalFilterDefaultLen] = {
+const double HcrVelFirFilt::finalFilterDefault[FinalFilterDefaultLen] = {
   2.8821826e-04, 7.9095771e-04, 1.5695770e-03, 2.6840635e-03, 4.1883217e-03,
   6.1251990e-03, 8.5216287e-03, 1.1384298e-02, 1.4696240e-02, 1.8414716e-02,
   2.2470653e-02, 2.6769843e-02, 3.1195919e-02, 3.5615037e-02, 3.9882036e-02,
@@ -105,40 +103,35 @@ const double FindSurfaceVel::finalFilterDefault[FinalFilterDefaultLen] = {
 
 // Constructor
 
-FindSurfaceVel::FindSurfaceVel()
+HcrVelFirFilt::HcrVelFirFilt()
   
 {
 
   _debug = false;
   _verbose = false;
-  
-  _dbzMax = NULL;
-  _rangeToSurface = NULL;
-  _surfaceVelArray = NULL;
+
+  _dbzSurf = NULL;
+  _rangeToSurf = NULL;
+  _velSurfArray = NULL;
   _filteredStage1 = NULL;
   _filteredSpike = NULL;
   _filteredCond = NULL;
   _filteredFinal = NULL;
   _nValid = 0;
 
-  _dbzFieldName = "DBZ";
-  _velFieldName = "VEL";
-  _minRangeToSurfaceKm = 0.5;
-  _minDbzForSurfaceEcho = 20.0;
-  _nGatesForSurfaceEcho = 1;
   _spikeFilterDifferenceThreshold = 0.11;
 
   // set up the default filters
   
-  initFilters(Stage1FilterDefaultLen, stage1FilterDefault,
-              SpikeFilterDefaultLen, spikeFilterDefault,
-              FinalFilterDefaultLen, finalFilterDefault);
+  initFirFilters(Stage1FilterDefaultLen, stage1FilterDefault,
+                 SpikeFilterDefaultLen, spikeFilterDefault,
+                 FinalFilterDefaultLen, finalFilterDefault);
   
 }
 
 // destructor
 
-FindSurfaceVel::~FindSurfaceVel()
+HcrVelFirFilt::~HcrVelFirFilt()
 
 {
 
@@ -148,14 +141,14 @@ FindSurfaceVel::~FindSurfaceVel()
     RadxRay::deleteIfUnused(_filtRays[iray]);
   }
 
-  if (_dbzMax) {
-    delete[] _dbzMax;
+  if (_dbzSurf) {
+    delete[] _dbzSurf;
   }
-  if (_rangeToSurface) {
-    delete[] _rangeToSurface;
+  if (_rangeToSurf) {
+    delete[] _rangeToSurf;
   }
-  if (_surfaceVelArray) {
-    delete[] _surfaceVelArray;
+  if (_velSurfArray) {
+    delete[] _velSurfArray;
   }
   if (_filteredStage1) {
     delete[] _filteredStage1;
@@ -172,16 +165,83 @@ FindSurfaceVel::~FindSurfaceVel()
 
 }
 
+/////////////////////////////////////////////////////
+// get results
+// the following return NAN if results not available
+
+double HcrVelFirFilt::getVelMeasured() const
+{
+  if (!_velSurfArray || !_velIsValid) {
+    return NAN;
+  } else {
+    return _velSurfArray[_finalIndex];
+  }
+}
+
+double HcrVelFirFilt::getRangeToSurface() const
+{
+  if (!_rangeToSurf || !_velIsValid) {
+    return NAN;
+  } else {
+    return _rangeToSurf[_finalIndex];
+  }
+}
+
+double HcrVelFirFilt::getDbzSurf() const
+{
+  if (!_dbzSurf || !_velIsValid) {
+    return NAN;
+  } else {
+    return _dbzSurf[_finalIndex];
+  }
+}
+
+double HcrVelFirFilt::getVelStage1() const
+{
+  if (!_filteredStage1 || !_velIsValid) {
+    return NAN;
+  } else {
+    return _filteredStage1[_finalIndex];
+  }
+}
+
+double HcrVelFirFilt::getVelSpike() const
+{
+  if (!_filteredSpike || !_velIsValid) {
+    return NAN;
+  } else {
+    return _filteredSpike[_finalIndex];
+  }
+}
+
+double HcrVelFirFilt::getVelCond() const
+{
+  if (!_filteredCond || !_velIsValid) {
+    return NAN;
+  } else {
+    return _filteredCond[_finalIndex];
+  }
+}
+
+double HcrVelFirFilt::getVelFilt() const
+{
+  if (!_filteredFinal || !_velIsValid) {
+    return NAN;
+  } else {
+    return _filteredFinal[_finalIndex];
+  }
+}
+
 //////////////////////////////////////////////////
 // initialzie the filters from arrays
 
-void FindSurfaceVel::initFilters(int stage1FilterLen,
-                                 const double *filtCoeffStage1,
-                                 int spikeFilterLen,
-                                 const double *filtCoeffSpike,
-                                 int finalFilterLen,
-                                 const double *filtCoeffFinal)
-                                 
+void HcrVelFirFilt::initFirFilters(int stage1FilterLen,
+                                    const double *filtCoeffStage1,
+                                    int spikeFilterLen,
+                                    const double *filtCoeffSpike,
+                                    int finalFilterLen,
+                                    const double *filtCoeffFinal)
+  
 {
 
   _filtCoeffStage1.clear();
@@ -200,17 +260,17 @@ void FindSurfaceVel::initFilters(int stage1FilterLen,
     _filtCoeffFinal.push_back(filtCoeffFinal[ii]);
   }
   
-  _initFromFilters();
+  _initFromFirFilters();
 
 }
 
 //////////////////////////////////////////////////
 // initialize the filters from vectors
 
-void FindSurfaceVel::initFilters(const vector<double> &filtCoeffStage1,
-                                 const vector<double> &filtCoeffSpike,
-                                 const vector<double> &filtCoeffFinal)
-                                 
+void HcrVelFirFilt::initFirFilters(const vector<double> &filtCoeffStage1,
+                                    const vector<double> &filtCoeffSpike,
+                                    const vector<double> &filtCoeffFinal)
+  
 {
 
   _filtCoeffStage1.clear();
@@ -221,14 +281,14 @@ void FindSurfaceVel::initFilters(const vector<double> &filtCoeffStage1,
   _filtCoeffSpike = filtCoeffSpike;
   _filtCoeffFinal = filtCoeffFinal;
 
-  _initFromFilters();
+  _initFromFirFilters();
 
 }
 
 //////////////////////////////////////////////////
 // initialize variables based on filters
 
-void FindSurfaceVel::_initFromFilters()
+void HcrVelFirFilt::_initFromFirFilters()
   
 {
 
@@ -266,17 +326,17 @@ void FindSurfaceVel::_initFromFilters()
 
   int nbytes = _filtBufLen * sizeof(double);
   
-  _dbzMax = new double[_filtBufLen];
-  _rangeToSurface = new double[_filtBufLen];
-  _surfaceVelArray = new double[_filtBufLen];
+  _dbzSurf = new double[_filtBufLen];
+  _rangeToSurf = new double[_filtBufLen];
+  _velSurfArray = new double[_filtBufLen];
   _filteredSpike = new double[_filtBufLen];
   _filteredStage1 = new double[_filtBufLen];
   _filteredCond = new double[_filtBufLen];
   _filteredFinal = new double[_filtBufLen];
 
-  memset(_dbzMax, 0, nbytes);
-  memset(_rangeToSurface, 0, nbytes);
-  memset(_surfaceVelArray, 0, nbytes);
+  memset(_dbzSurf, 0, nbytes);
+  memset(_rangeToSurf, 0, nbytes);
+  memset(_velSurfArray, 0, nbytes);
   memset(_filteredSpike, 0, nbytes);
   memset(_filteredStage1, 0, nbytes);
   memset(_filteredCond, 0, nbytes);
@@ -298,12 +358,15 @@ void FindSurfaceVel::_initFromFilters()
 }
 
 /////////////////////////////////////////////////////////////////////////
-// Process an incoming ray
+// Process an incoming ray, filtering the surface vel.
 // Returns 0 on success, -1 on failure.
 // On success, call getSurfaceVelocity() to get computed surface velocity
 
-int FindSurfaceVel::processRay(RadxRay *ray)
-
+int HcrVelFirFilt::filterRay(RadxRay *ray, 
+                             double velSurf,
+                             double dbzSurf,
+                             double rangeToSurf)
+  
 {
 
   // convert to floats
@@ -327,10 +390,12 @@ int FindSurfaceVel::processRay(RadxRay *ray)
   ray->addClient();
   _filtRays.push_front(ray);
   
-  // compute surface vel, store at end of array
-  
-  _computeSurfaceVel(ray);
-  
+  // compute surface vel, store at start of array
+
+  _dbzSurf[0] = dbzSurf;
+  _rangeToSurf[0] = rangeToSurf;
+  _velSurfArray[0] = velSurf;
+
   // apply the spike and stage1 filters
 
   _applyStage1Filter();
@@ -347,7 +412,7 @@ int FindSurfaceVel::processRay(RadxRay *ray)
 
   // was this a valid observation? - i.e. can we see the surface
 
-  if (_rangeToSurface[0] > 0) {
+  if (_rangeToSurf[0] > 0) {
     _nValid++;
   } else {
     _nValid = 0;
@@ -358,12 +423,13 @@ int FindSurfaceVel::processRay(RadxRay *ray)
   if (_verbose) {
     if (_filtRays.size() > _finalIndex) {
       RadxRay *ray = _filtRays[_finalIndex];
-      if (_rangeToSurface[_finalIndex] > 0) {
-        cerr << "Time gndRange dbzMax surfVel filtStage1 filtSpike filtCond filtFinal: "
+      if (_rangeToSurf[_finalIndex] > 0) {
+        cerr << "Surface data: time range dbzSurf vel "
+             << "filtStage1 filtSpike filtCond filtFinal: "
              << ray->getRadxTime().asString() << " "
-             << _rangeToSurface[_finalIndex] << " "
-             << _dbzMax[_finalIndex] << " "
-             << _surfaceVelArray[_finalIndex] << " "
+             << _rangeToSurf[_finalIndex] << " "
+             << _dbzSurf[_finalIndex] << " "
+             << _velSurfArray[_finalIndex] << " "
              << _filteredStage1[_finalIndex] <<  ""
              << _filteredSpike[_finalIndex] << " "
              << _filteredCond[_finalIndex] << " "
@@ -378,14 +444,12 @@ int FindSurfaceVel::processRay(RadxRay *ray)
   // check for success
   
   _velIsValid = false;
-  _surfaceVel = -9999.0;
   _filtRay = _filtRays[_filtRays.size()-1];
   
   if (_filtRays.size() > _finalIndex) {
     _filtRay = _filtRays[_finalIndex];
     if (_nValid > _finalIndex) {
       _velIsValid = true;
-      _surfaceVel = _filteredFinal[_finalIndex];
     }
     return 0;
   }
@@ -395,143 +459,23 @@ int FindSurfaceVel::processRay(RadxRay *ray)
 }
 
 /////////////////////////////////////////////////////////////////////////
-// compute surface velocity
-//
-// Sets vel to (0.0) if cannot determine valocity
-
-void FindSurfaceVel::_computeSurfaceVel(RadxRay *ray)
-  
-{
-
-  // init
-  
-  _dbzMax[0] = -9999.0;
-  _rangeToSurface[0] = -9999.0;
-  _surfaceVelArray[0] = 0.0;
-
-  // check elevation
-  // cannot compute gnd vel if not pointing down
-  
-  double elev = ray->getElevationDeg();
-  if (elev > -85 || elev < -95) {
-    if (_debug) {
-      cerr << "Bad elevation for finding surface, time, elev(deg): "
-           << ray->getRadxTime().asString() << ", "
-           << elev << endl;
-    }
-    return;
-  }
-
-  // get dbz field
-
-  RadxField *dbzField = ray->getField(_dbzFieldName);
-  if (dbzField == NULL) {
-    cerr << "ERROR - FindSurfaceVel::_computeSurfaceVel" << endl;
-    cerr << "  No dbz field found, field name: " << _dbzFieldName << endl;
-    return;
-  }
-  const Radx::fl32 *dbzArray = dbzField->getDataFl32();
-  Radx::fl32 dbzMiss = dbzField->getMissingFl32();
-
-  // get vel field
-  
-  RadxField *velField = ray->getField(_velFieldName);
-  if (velField == NULL) {
-    cerr << "ERROR - FindSurfaceVel::_computeSurfaceVel" << endl;
-    cerr << "  No vel field found, field name: " << _velFieldName << endl;
-    return;
-  }
-  const Radx::fl32 *velArray = velField->getDataFl32();
-  Radx::fl32 velMiss = velField->getMissingFl32();
-  
-  // get gate at which max dbz occurs
-
-  double range = dbzField->getStartRangeKm();
-  double drange = dbzField->getGateSpacingKm();
-  double dbzMax = -9999.0;
-  int gateForMax = -1;
-  double rangeToSurface = 0;
-  double foundSurface = false;
-  for (size_t igate = 0; igate < dbzField->getNPoints(); igate++, range += drange) {
-    if (range < _minRangeToSurfaceKm) {
-      continue;
-    }
-    Radx::fl32 dbz = dbzArray[igate];
-    if (dbz != dbzMiss) {
-      if (dbz > dbzMax) {
-        dbzMax = dbz;
-        gateForMax = igate;
-        rangeToSurface = range;
-        foundSurface = true;
-      }
-    }
-  }
-  
-  // check for sufficient power
-
-  if (foundSurface) {
-    if (dbzMax < _minDbzForSurfaceEcho) {
-      foundSurface = false;
-      if (_debug) {
-        cerr << "WARNING - FindSurfaceVel::_computeSurfaceVel" << endl;
-        cerr << "  Ray at time: " << ray->getRadxTime().asString() << endl;
-        cerr << "  Dbz max not high enough for surface detection: " << dbzMax << endl;
-        cerr << "  Range to max dbz: " << rangeToSurface << endl;
-      }
-    }
-  }
-
-  size_t nEachSide = _nGatesForSurfaceEcho / 2;
-  if (foundSurface) {
-    for (size_t igate = gateForMax - nEachSide; igate <= gateForMax + nEachSide; igate++) {
-      Radx::fl32 dbz = dbzArray[igate];
-      if (dbz == dbzMiss) {
-        foundSurface = false;
-      }
-      if (dbz < _minDbzForSurfaceEcho) {
-        foundSurface = false;
-      }
-    }
-  }
-  
-  // compute surface vel
-  
-  if (foundSurface) {
-    double sum = 0.0;
-    double count = 0.0;
-    for (size_t igate = gateForMax - nEachSide; igate <= gateForMax + nEachSide; igate++) {
-      Radx::fl32 vel = velArray[igate];
-      if (vel == velMiss) {
-        foundSurface = false;
-      }
-      sum += vel;
-      count++;
-    }
-    _surfaceVelArray[0] = sum / count;
-    _dbzMax[0] = dbzMax;
-    _rangeToSurface[0] = rangeToSurface;
-  }
-
-}
-
-/////////////////////////////////////////////////////////////////////////
 // apply the stage1 filter
 // this is applied to the tail end of the incoming data
 
-void FindSurfaceVel::_applyStage1Filter()
+void HcrVelFirFilt::_applyStage1Filter()
 
 {
   
   double sum = 0.0;
   double sumWts = 0.0;
   for (size_t ii = 0; ii < _lenStage1; ii++) {
-    double vel = _surfaceVelArray[ii];
+    double vel = _velSurfArray[ii];
     double wt = _filtCoeffStage1[ii];
     sum += wt * vel;
     sumWts += wt;
   }
 
-  double filtVal = _surfaceVelArray[_lenStage1Half];
+  double filtVal = _velSurfArray[_lenStage1Half];
   if (sumWts > 0) {
     filtVal = sum / sumWts;
   }
@@ -543,20 +487,20 @@ void FindSurfaceVel::_applyStage1Filter()
 /////////////////////////////////////////////////////////////////////////
 // apply the spike filter
 
-void FindSurfaceVel::_applySpikeFilter()
+void HcrVelFirFilt::_applySpikeFilter()
 
 {
 
   double sum = 0.0;
   double sumWts = 0.0;
   for (size_t ii = 0; ii < _lenSpike; ii++) {
-    double vel = _surfaceVelArray[ii];
+    double vel = _velSurfArray[ii];
     double wt = _filtCoeffSpike[ii];
     sum += wt * vel;
     sumWts += wt;
   }
 
-  double filtVal = _surfaceVelArray[_lenSpikeHalf];
+  double filtVal = _velSurfArray[_lenSpikeHalf];
   if (sumWts > 0) {
     filtVal = sum / sumWts;
   }
@@ -568,7 +512,7 @@ void FindSurfaceVel::_applySpikeFilter()
 /////////////////////////////////////////////////////////////////////////
 // apply the final filter to compute the final filtered velocity
 
-void FindSurfaceVel::_applyFinalFilter()
+void HcrVelFirFilt::_applyFinalFilter()
 
 {
   
@@ -595,7 +539,7 @@ void FindSurfaceVel::_applyFinalFilter()
 /////////////////////////////////////////////////////////////////////////
 // compute the conditioned value
 
-void FindSurfaceVel::_computeConditionedValue()
+void HcrVelFirFilt::_computeConditionedValue()
 
 {
   
@@ -603,7 +547,7 @@ void FindSurfaceVel::_computeConditionedValue()
 
   double filtStage1 = _filteredStage1[_condIndex];
   double filtSpike = _filteredSpike[_condIndex];
-  double surfaceVel = _surfaceVelArray[_condIndex];
+  double surfaceVel = _velSurfArray[_condIndex];
   double conditionedVel = surfaceVel;
 
   double absDiff = fabs(surfaceVel - filtStage1);
@@ -618,14 +562,14 @@ void FindSurfaceVel::_computeConditionedValue()
 //////////////////////////////////////////////////
 // shift the arrays by 1
 
-void FindSurfaceVel::_shiftArraysBy1()
+void HcrVelFirFilt::_shiftArraysBy1()
 {
   
   int nbytesMove = (_filtBufLen - 1) * sizeof(double);
   
-  memmove(_dbzMax + 1, _dbzMax, nbytesMove);
-  memmove(_rangeToSurface + 1, _rangeToSurface, nbytesMove);
-  memmove(_surfaceVelArray + 1, _surfaceVelArray, nbytesMove);
+  memmove(_dbzSurf + 1, _dbzSurf, nbytesMove);
+  memmove(_rangeToSurf + 1, _rangeToSurf, nbytesMove);
+  memmove(_velSurfArray + 1, _velSurfArray, nbytesMove);
   memmove(_filteredSpike + 1, _filteredSpike, nbytesMove);
   memmove(_filteredStage1 + 1, _filteredStage1, nbytesMove);
   memmove(_filteredCond + 1, _filteredCond, nbytesMove);

@@ -24,7 +24,7 @@
 /////////////////////////////////////////////////////////////
 // DistPolynomial.hh
 //
-// Normal distribution
+// Polynomial-based distribution
 //
 // Mike Dixon, EOL, NCAR, P.O.Box 3000, Boulder, CO, 80307-3000, USA
 //
